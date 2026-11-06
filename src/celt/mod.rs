@@ -1135,6 +1135,15 @@ const VERY_SMALL: f32 = 1e-30f32;
 /// `CELT_SIG_SCALE`, and the caller wants it at unity.
 const SIG2RES: f32 = 1.0 / 32768.0;
 
+fn cap_native_spectrum(freq: &mut [f32], frame_size: usize, downsample: usize) {
+    // N = 48 kHz synthesis bins/channel, d = 48000/Fs: bins >= N/d exceed output Nyquist.
+    if downsample != 1 {
+        for channel in freq.chunks_exact_mut(frame_size) {
+            channel[frame_size / downsample..].fill(0.0);
+        }
+    }
+}
+
 /// One channel of `celt_decoder.c`'s `deemphasis`: the de-emphasis recursion,
 /// and the downsampling that follows it.
 ///
@@ -3520,6 +3529,7 @@ impl CeltDecoder {
                 (1 << lm) as usize,
             );
         }
+        cap_native_spectrum(freq, frame_size, self.downsample);
         // Downmixing a stereo stream to a mono output (C=2, CC=1). libopus sums
         // the two denormalised spectra and runs a *single* inverse MDCT over the
         // sum (celt_decoder.c, `celt_synthesis`), so the decoder keeps one
@@ -3938,6 +3948,8 @@ impl CeltDecoder {
             c,
             1usize << lm,
         );
+
+        cap_native_spectrum(freq, n, self.downsample);
 
         let shift = mode.max_lm - lm;
         let out_syn_idx = DECODE_BUFFER_SIZE - n;
@@ -4494,6 +4506,120 @@ mod tests {
                 "OPUS_PURE_REQUIRE_SIMD asked for `{want}`, but this host dispatches to \
                  [{summary}] — nothing here exercised the kernels behind `{want}`"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod native_rate_tests {
+    use super::*;
+    use crate::{Application, Bandwidth, MAX_PACKET_BYTES, OpusEncoder};
+
+    fn check_spectrum(decoder: &CeltDecoder, n: usize, lm: usize, coded: usize, start: usize) {
+        let mut full = vec![0.0; n * coded];
+        denormalise_bands(
+            decoder.mode,
+            &decoder.w_x,
+            &mut full,
+            &decoder.w_band_amp,
+            start,
+            21,
+            coded,
+            1 << lm,
+        );
+        if decoder.channels == 1 && coded == 2 {
+            let (left, right) = full.split_at_mut(n);
+            for (left, right) in left.iter_mut().zip(right.iter()) {
+                *left = 0.5 * *left + 0.5 * *right;
+            }
+        }
+        let cutoff = n / decoder.downsample;
+        for ch in 0..coded {
+            assert_eq!(
+                &decoder.w_freq[ch * n..ch * n + cutoff],
+                &full[ch * n..ch * n + cutoff]
+            );
+            assert!(
+                decoder.w_freq[ch * n + cutoff..(ch + 1) * n]
+                    .iter()
+                    .all(|&v| v == 0.0)
+            );
+            if decoder.downsample != 1 {
+                assert!(
+                    full[ch * n + cutoff..(ch + 1) * n]
+                        .iter()
+                        .any(|&v| v != 0.0)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_rate_packet_synthesis_caps_each_coded_channel() {
+        for lm in 0..=3 {
+            let n = 120 << lm;
+            for coded in [1, 2] {
+                let mut encoder =
+                    OpusEncoder::new(48_000, coded, Application::RestrictedLowDelay).unwrap();
+                encoder.bitrate_bps = 128_000;
+                encoder.force_bandwidth = Some(Bandwidth::Fullband);
+                let pcm: Vec<f32> = (0..n * coded)
+                    .map(|i| {
+                        if (i / coded + i % coded) % 4 < 2 {
+                            0.25
+                        } else {
+                            -0.25
+                        }
+                    })
+                    .collect();
+                let mut packet = [0; MAX_PACKET_BYTES];
+                let bytes = encoder.encode(&pcm, n, &mut packet).unwrap();
+                assert_eq!(packet[0] & 3, 0);
+                assert_eq!(crate::packet::channels(&packet[..bytes]).unwrap(), coded);
+                assert_eq!(
+                    crate::packet::bandwidth(&packet[..bytes]).unwrap(),
+                    Bandwidth::Fullband
+                );
+                for outputs in [1, 2] {
+                    for downsample in [1, 2, 3, 4, 6] {
+                        let mut decoder = CeltDecoder::new(modes::default_mode(), outputs);
+                        decoder.set_stream_channels(coded);
+                        decoder.set_downsample(downsample);
+                        let mut rc = RangeCoder::new_decoder(&packet[1..bytes]);
+                        let mut output = vec![0.0; n / downsample * outputs];
+                        assert_eq!(
+                            decoder.decode_from_range_coder_with_band_range(
+                                &mut rc,
+                                ((bytes - 1) * 8) as i32,
+                                n / downsample,
+                                &mut output,
+                                0,
+                                21,
+                            ),
+                            n
+                        );
+                        check_spectrum(&decoder, n, lm, coded, 0);
+                        assert!(output.iter().all(|v| v.is_finite()));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_rate_noise_concealment_caps_each_channel() {
+        for lm in 0..=3 {
+            let n = 120 << lm;
+            for channels in [1, 2] {
+                for downsample in [1, 2, 3, 4, 6] {
+                    for start in [0, 17] {
+                        let mut decoder = CeltDecoder::new(modes::default_mode(), channels);
+                        decoder.set_downsample(downsample);
+                        decoder.conceal_fill_noise(n, lm, start, 21);
+                        check_spectrum(&decoder, n, lm, channels, start);
+                    }
+                }
+            }
         }
     }
 }
