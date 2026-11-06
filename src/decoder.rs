@@ -1249,9 +1249,9 @@ impl OpusDecoder {
                     let f5 = (self.sampling_rate / 200) as usize;
                     let f2_5 = f5 / 2;
                     let red_end_band = celt_endband_for_bandwidth(bandwidth);
-                    let mut red_buf = [0.0f32; 480]; // F5 * <=2ch, planar
+                    let mut red_buf = [0.0f32; 480]; // F5 * <=2ch, interleaved
                     let mut red_bytes = 0usize;
-                    if self.sampling_rate == 48000 && rc.tell() + 17 <= (plen as i32) * 8 {
+                    if rc.tell() + 17 <= (plen as i32) * 8 {
                         redundancy = true;
                         celt_to_silk = rc.decode_bit_logp(1);
                         red_bytes = plen - (((rc.tell() + 7) >> 3) as usize);
@@ -1284,8 +1284,7 @@ impl OpusDecoder {
                     // decoding a 2-byte silence frame; its 2.5 ms overlap tail is
                     // ADDED to the output (libopus decodes it into pcm before the
                     // SILK sum).
-                    if self.sampling_rate == 48000
-                        && prev_mode_frame == Some(OpusMode::Hybrid)
+                    if prev_mode_frame == Some(OpusMode::Hybrid)
                         && !(redundancy && celt_to_silk && self.prev_redundancy)
                     {
                         let silence = [0xFFu8, 0xFF];
@@ -1556,7 +1555,6 @@ impl OpusDecoder {
                     let red_end_band = celt_endband_for_bandwidth(bandwidth);
                     let mut red_buf = [0.0f32; 480];
                     let mut redundant_rng = 0u32;
-                    let do_red = redundancy && self.sampling_rate == 48000;
                     // As in the SILK-only arm: a redundant frame replaces the
                     // mode-switch cross-fade (opus_decoder.c:532), and the
                     // concealment must run before the redundant frame or the
@@ -1567,7 +1565,7 @@ impl OpusDecoder {
                     }
                     // CELT->SILK: redundant frame decodes BEFORE the main CELT,
                     // continuing the prior CELT state (fade-out of previous CELT).
-                    if do_red && celt_to_silk {
+                    if redundancy && celt_to_silk {
                         redundant_rng = self.decode_redundant_celt(
                             &payload[plen - red_bytes..],
                             false,
@@ -1608,7 +1606,7 @@ impl OpusDecoder {
 
                     // SILK->CELT: reset + decode the redundant frame AFTER the main
                     // decode; it primes the CELT state for the upcoming CELT mode.
-                    if do_red && !celt_to_silk {
+                    if redundancy && !celt_to_silk {
                         redundant_rng = self.decode_redundant_celt(
                             &payload[plen - red_bytes..],
                             true,
@@ -1617,7 +1615,7 @@ impl OpusDecoder {
                             &mut red_buf[..f5 * self.channels],
                         );
                     }
-                    if do_red {
+                    if redundancy {
                         let window = celt::modes::default_mode().window;
                         let region = &mut output[out_start..out_start + silk_out_len];
                         if celt_to_silk {
@@ -1677,8 +1675,8 @@ impl OpusDecoder {
 
     /// Decode a redundant CELT frame (opus_decoder.c "5 ms redundant frame"):
     /// start band 0, end band from the packet bandwidth, 5 ms, its own range
-    /// decoder. Returns the redundant final range; PLANAR output in `buf`
-    /// (F5 samples per state channel). Only valid at 48 kHz output.
+    /// decoder. Returns the redundant final range; interleaved API-rate output
+    /// in `buf` (Fs/200 samples per output channel).
     fn decode_redundant_celt(
         &mut self,
         red: &[u8],
@@ -1705,8 +1703,9 @@ impl OpusDecoder {
 const HYBRID_START_BAND: usize = 17;
 
 /// libopus opus_decoder.c bandwidth -> CELT end band for the packet.
-/// smooth_fade cross-fades (w = window[i]^2, 48 kHz inc=1) applied to the
+/// smooth_fade cross-fades (w = window[i * inc]^2, inc = 48000/Fs) applied to the
 /// interleaved output region of one frame. `red` is interleaved too.
+/// inc = window.len()/f2_5 = 120/(Fs/400), since the window is 2.5 ms at 48 kHz.
 /// celt_to_silk: redundant frame occupies the START of the frame — first 2.5 ms
 /// copied verbatim, next 2.5 ms fades redundant -> main.
 ///
@@ -1724,9 +1723,10 @@ fn redundancy_fade_start(
     channels: usize,
     window: &[f32],
 ) {
+    let inc = window.len() / f2_5;
     out[..f2_5 * channels].copy_from_slice(&red[..f2_5 * channels]);
     for i in 0..f2_5 {
-        let w = window[i] * window[i];
+        let w = window[i * inc] * window[i * inc];
         for c in 0..channels {
             let idx = (f2_5 + i) * channels + c;
             out[idx] = (1.0 - w) * red[idx] + w * out[idx];
@@ -1753,11 +1753,129 @@ fn redundancy_fade_end(
     channels: usize,
     window: &[f32],
 ) {
+    let inc = window.len() / f2_5;
     for i in 0..f2_5 {
-        let w = window[i] * window[i];
+        let w = window[i * inc] * window[i * inc];
         for c in 0..channels {
             let idx = (frame_samples - f2_5 + i) * channels + c;
             out[idx] = (1.0 - w) * out[idx] + w * red[(f2_5 + i) * channels + c];
+        }
+    }
+}
+
+#[cfg(test)]
+mod native_rate_tests {
+    use super::*;
+
+    #[test]
+    fn native_rate_redundancy_fades_follow_the_48k_window() {
+        let window = celt::modes::default_mode().window;
+        for rate in [8_000, 12_000, 16_000, 24_000, 48_000] {
+            let f2_5 = rate / 400;
+            let stride = 48_000 / rate;
+            for channels in [1, 2] {
+                let frame = rate / 50;
+                let source: Vec<f32> = (0..frame * channels + 4).map(|i| i as f32 * 0.01).collect();
+                let red: Vec<f32> = (0..2 * f2_5 * channels)
+                    .map(|i| 1.0 - i as f32 * 0.02)
+                    .collect();
+                let mut start = source.clone();
+                let mut end = source.clone();
+                redundancy_fade_start(&mut start, &red, f2_5, channels, window);
+                redundancy_fade_end(&mut end, frame, &red, f2_5, channels, window);
+                for index in 0..source.len() {
+                    let sample = index / channels;
+                    let expected_start = if sample < f2_5 {
+                        red[index]
+                    } else if sample < 2 * f2_5 {
+                        let w = window[(sample - f2_5) * stride].powi(2);
+                        (1.0 - w) * red[index] + w * source[index]
+                    } else {
+                        source[index]
+                    };
+                    let expected_end = if (frame - f2_5..frame).contains(&sample) {
+                        let w = window[(sample - (frame - f2_5)) * stride].powi(2);
+                        let red_index =
+                            (f2_5 + sample - (frame - f2_5)) * channels + index % channels;
+                        (1.0 - w) * source[index] + w * red[red_index]
+                    } else {
+                        source[index]
+                    };
+                    assert_eq!(
+                        start[index], expected_start,
+                        "start, {rate} Hz, channels {channels}, index {index}"
+                    );
+                    assert_eq!(
+                        end[index], expected_end,
+                        "end, {rate} Hz, channels {channels}, index {index}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod native_rate_tail_tests {
+    use super::*;
+
+    #[test]
+    fn native_rate_hybrid_to_silk_preserves_the_celt_overlap_tail() {
+        for fixture in [
+            include_str!("../tests/fixtures/transition-1ch.txt"),
+            include_str!("../tests/fixtures/transition-2ch.txt"),
+        ] {
+            let packets: Vec<Vec<u8>> = fixture
+                .lines()
+                .map(|line| {
+                    let (_, hex) = line.split_once(' ').unwrap();
+                    (0..hex.len())
+                        .step_by(2)
+                        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                        .collect()
+                })
+                .collect();
+            assert_eq!(mode_from_toc(packets[17][0]), OpusMode::Hybrid);
+            assert_eq!(mode_from_toc(packets[18][0]), OpusMode::SilkOnly);
+            for rate in [8_000, 12_000, 16_000, 24_000, 48_000] {
+                for channels in [1, 2] {
+                    let mut actual = OpusDecoder::new(rate, channels).unwrap();
+                    let mut expected = OpusDecoder::new(rate, channels).unwrap();
+                    let frame = rate as usize / 50;
+                    let mut output = vec![0.0; frame * channels];
+                    let mut reference = output.clone();
+                    for packet in &packets[..18] {
+                        actual.decode(packet, frame, &mut output).unwrap();
+                        expected.decode(packet, frame, &mut reference).unwrap();
+                    }
+                    assert!(!expected.prev_redundancy);
+                    let f2_5 = rate as usize / 400;
+                    let mut tail = vec![0.0; f2_5 * channels];
+                    let mut rc = RangeCoder::new_decoder(&[0xff, 0xff]);
+                    expected.celt_dec.decode_from_range_coder_with_band_range(
+                        &mut rc,
+                        16,
+                        f2_5,
+                        &mut tail,
+                        0,
+                        celt_endband_for_bandwidth(bandwidth_from_toc(packets[18][0])),
+                    );
+                    assert!(tail.iter().any(|&v| v != 0.0));
+                    // Render SILK separately, so the expected output retains the outgoing CELT tail.
+                    expected.prev_mode = Some(OpusMode::SilkOnly);
+                    expected
+                        .decode(&packets[18], frame, &mut reference)
+                        .unwrap();
+                    for (sample, tail) in reference.iter_mut().zip(tail) {
+                        *sample += tail;
+                    }
+                    actual.decode(&packets[18], frame, &mut output).unwrap();
+                    assert!(
+                        output == reference,
+                        "overlap tail differs at {rate} Hz, channels {channels}"
+                    );
+                }
+            }
         }
     }
 }
