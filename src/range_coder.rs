@@ -468,22 +468,17 @@ impl<'a> RangeCoder<'a> {
         let mut s = self.rng;
         let d = self.val;
         let r = s >> ftb;
-        let mut ret = 0;
-        let mut t;
-
-        loop {
-            t = s;
-            s = r.wrapping_mul(icdf[ret] as u32);
-            ret += 1;
+        for (ret, &probability) in icdf.iter().enumerate() {
+            let t = s;
+            s = r.wrapping_mul(u32::from(probability));
             if d >= s {
-                break;
+                self.val = d.wrapping_sub(s);
+                self.rng = t.wrapping_sub(s);
+                self.normalize_decoder();
+                return ret as i32;
             }
         }
-
-        self.val = d.wrapping_sub(s);
-        self.rng = t.wrapping_sub(s);
-        self.normalize_decoder();
-        (ret - 1) as i32
+        panic!("inverse CDF lacks a terminating symbol");
     }
 
     #[inline(always)]
