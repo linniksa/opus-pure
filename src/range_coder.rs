@@ -129,24 +129,41 @@ impl<'a> RangeCoder<'a> {
 
     #[inline(always)]
     fn normalize_decoder(&mut self) {
-        let mut guard = 0u32;
-        while self.rng <= EC_CODE_BOT {
-            guard += 1;
-            if guard > 100 {
-                self.error = 1;
-                self.rng = EC_CODE_BOT + 1;
-                break;
-            }
-            self.nbits_total += EC_SYM_BITS as i32;
-            self.rng <<= EC_SYM_BITS;
-
-            let sym = self.rem;
-            self.rem = self.read_byte() as i32;
-
-            let combined_sym = ((sym << EC_SYM_BITS) | self.rem) >> (EC_SYM_BITS - EC_CODE_EXTRA);
-            self.val = (self.val << EC_SYM_BITS).wrapping_add(EC_SYM_MAX & !combined_sym as u32)
-                & (EC_CODE_TOP - 1);
+        if self.rng > EC_CODE_BOT {
+            return;
         }
+        // Nonzero rng exceeds EC_CODE_BOT = 2^23 after at most ceil(24 / 8) = 3 byte shifts.
+        if self.rng == 0 {
+            self.normalize_zero_decoder();
+            return;
+        }
+        while self.rng <= EC_CODE_BOT {
+            self.normalize_decoder_byte();
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn normalize_zero_decoder(&mut self) {
+        // Preserve the guard's 100 state updates before reporting the zero-range error.
+        for _ in 0..100 {
+            self.normalize_decoder_byte();
+        }
+        self.error = 1;
+        self.rng = EC_CODE_BOT + 1;
+    }
+
+    #[inline(always)]
+    fn normalize_decoder_byte(&mut self) {
+        self.nbits_total += EC_SYM_BITS as i32;
+        self.rng <<= EC_SYM_BITS;
+
+        let sym = self.rem;
+        self.rem = self.read_byte() as i32;
+
+        let combined_sym = ((sym << EC_SYM_BITS) | self.rem) >> (EC_SYM_BITS - EC_CODE_EXTRA);
+        self.val = (self.val << EC_SYM_BITS).wrapping_add(EC_SYM_MAX & !combined_sym as u32)
+            & (EC_CODE_TOP - 1);
     }
 
     fn read_byte(&mut self) -> u8 {
@@ -468,22 +485,17 @@ impl<'a> RangeCoder<'a> {
         let mut s = self.rng;
         let d = self.val;
         let r = s >> ftb;
-        let mut ret = 0;
-        let mut t;
-
-        loop {
-            t = s;
-            s = r.wrapping_mul(icdf[ret] as u32);
-            ret += 1;
+        for (ret, &probability) in icdf.iter().enumerate() {
+            let t = s;
+            s = r.wrapping_mul(u32::from(probability));
             if d >= s {
-                break;
+                self.val = d.wrapping_sub(s);
+                self.rng = t.wrapping_sub(s);
+                self.normalize_decoder();
+                return ret as i32;
             }
         }
-
-        self.val = d.wrapping_sub(s);
-        self.rng = t.wrapping_sub(s);
-        self.normalize_decoder();
-        (ret - 1) as i32
+        panic!("inverse CDF lacks a terminating symbol");
     }
 
     #[inline(always)]
@@ -665,6 +677,10 @@ impl<'a> RangeCoder<'a> {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "normalization_tests.rs"]
+mod normalization_tests;
 
 #[cfg(test)]
 mod tests {

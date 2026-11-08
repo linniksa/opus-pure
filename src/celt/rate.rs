@@ -39,6 +39,11 @@ pub fn bits2pulses(m: &CeltMode, band: usize, mut lm: i32, bits: i32) -> i32 {
     let mut hi = cache[0] as i32;
     let cache = &cache[..=hi as usize];
 
+    // A zero budget has adjusted bits=-1, below every unsigned cache entry.
+    if bits == 0 {
+        return 0;
+    }
+
     let mut lo = 0i32;
     let bits = bits - 1; // bits--
 
@@ -500,3 +505,7 @@ fn interp_bits2pulses(
 
     coded_bands as i32
 }
+
+#[cfg(test)]
+#[path = "rate_cache_tests.rs"]
+mod rate_cache_tests;

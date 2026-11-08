@@ -437,32 +437,33 @@ fn kf_bfly4(
         {
             let stride2 = fstride * 2;
             let stride3 = fstride * 3;
-            let m2 = 2 * m;
-            let m3 = 3 * m;
             for i in 0..n {
                 let base = i * mm;
+                let block = &mut fout[base..base + 4 * m];
+                let (p0, rest) = block.split_at_mut(m);
+                let (p1, rest) = rest.split_at_mut(m);
+                let (p2, rest) = rest.split_at_mut(m);
+                let p3 = rest;
                 let mut tw1 = 0usize;
                 let mut tw2 = 0usize;
                 let mut tw3 = 0usize;
 
-                for j in 0..m {
-                    let idx = base + j;
+                for (((a0, a1), a2), a3) in p0.iter_mut().zip(p1).zip(p2).zip(p3) {
+                    let scratch0 = c_mul(a1, &twiddles[tw1]);
+                    let scratch1 = c_mul(a2, &twiddles[tw2]);
+                    let scratch2 = c_mul(a3, &twiddles[tw3]);
 
-                    let scratch0 = c_mul(&fout[idx + m], &twiddles[tw1]);
-                    let scratch1 = c_mul(&fout[idx + m2], &twiddles[tw2]);
-                    let scratch2 = c_mul(&fout[idx + m3], &twiddles[tw3]);
-
-                    let scratch5 = c_sub(&fout[idx], &scratch1);
-                    fout[idx] = c_add(&fout[idx], &scratch1);
+                    let scratch5 = c_sub(a0, &scratch1);
+                    *a0 = c_add(a0, &scratch1);
 
                     let scratch3 = c_add(&scratch0, &scratch2);
                     let scratch4 = c_sub(&scratch0, &scratch2);
 
-                    fout[idx + m2] = c_sub(&fout[idx], &scratch3);
-                    fout[idx] = c_add(&fout[idx], &scratch3);
+                    *a2 = c_sub(a0, &scratch3);
+                    *a0 = c_add(a0, &scratch3);
 
-                    fout[idx + m] = KissCpx::new(scratch5.r + scratch4.i, scratch5.i - scratch4.r);
-                    fout[idx + m3] = KissCpx::new(scratch5.r - scratch4.i, scratch5.i + scratch4.r);
+                    *a1 = KissCpx::new(scratch5.r + scratch4.i, scratch5.i - scratch4.r);
+                    *a3 = KissCpx::new(scratch5.r - scratch4.i, scratch5.i + scratch4.r);
 
                     tw1 += fstride;
                     tw2 += stride2;

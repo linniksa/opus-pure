@@ -141,8 +141,6 @@ pub fn silk_decode_core(
         let b_q14 = &ps_dec_ctrl.ltp_coef_q14[k * LTP_ORDER..];
         let signal_type = ps_dec.indices.signal_type;
 
-        let mut inv_gain_q31 = silk_inverse32_varq(ps_dec_ctrl.gains_q16[k], 47);
-
         let gain_adj_q16 = if ps_dec_ctrl.gains_q16[k] != ps_dec.prev_gain_q16 {
             let adj = silk_div32_varq(ps_dec.prev_gain_q16, ps_dec_ctrl.gains_q16[k], 16);
 
@@ -189,6 +187,7 @@ pub fn silk_decode_core(
                     0,
                 );
 
+                let mut inv_gain_q31 = silk_inverse32_varq(ps_dec_ctrl.gains_q16[k], 47);
                 if k == 0 {
                     inv_gain_q31 =
                         silk_lshift(silk_smulwb(inv_gain_q31, ps_dec_ctrl.ltp_scale_q14), 2);
@@ -265,3 +264,7 @@ pub fn silk_decode_core(
         .s_lpc_q14_buf
         .copy_from_slice(&s_lpc_q14[..MAX_LPC_ORDER]);
 }
+
+#[cfg(test)]
+#[path = "inverse_gain_tests.rs"]
+mod inverse_gain_tests;
