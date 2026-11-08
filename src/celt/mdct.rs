@@ -321,28 +321,22 @@ fn mdct_backward_post_rotation_scalar(
     n2: usize,
     overlap2: usize,
 ) {
-    for i in 0..((n4 + 1) >> 1) {
-        let im0 = f2[i].r;
-        let re0 = f2[i].i;
-        let t0_0 = trig[i];
-        let t1_0 = trig[n4 + i];
-
-        let yr0 = re0 * t0_0 + im0 * t1_0;
-        let yi0 = re0 * t1_0 - im0 * t0_0;
-
-        let j = n4 - 1 - i;
-        let im1 = f2[j].r;
-        let re1 = f2[j].i;
-        let t0_1 = trig[j];
-        let t1_1 = trig[n4 + j];
-
-        let yr1 = re1 * t0_1 + im1 * t1_1;
-        let yi1 = re1 * t1_1 - im1 * t0_1;
-
-        output[overlap2 + 2 * i] = yr0;
-        output[overlap2 + n2 - 1 - 2 * i] = yi0;
-        output[overlap2 + n2 - 2 - 2 * i] = yr1;
-        output[overlap2 + 2 * i + 1] = yi1;
+    assert_eq!(n2, 2 * n4);
+    let f2 = &f2[..n4];
+    let (t0, t1) = trig[..n2].split_at(n4);
+    // Adjacent output pairs remove mirrored store dependencies from the vectorizer.
+    let forward = f2.iter().zip(t0).zip(t1);
+    let backward = forward.clone().rev();
+    #[allow(
+        clippy::chunks_exact_to_as_chunks,
+        reason = "Keep adjacent-pair traversal and the scalar fallback."
+    )]
+    let pairs = output[overlap2..overlap2 + n2].chunks_exact_mut(2);
+    for (pair, (left, right)) in pairs.zip(forward.zip(backward)) {
+        let ((left, t0_left), t1_left) = left;
+        let ((right, t0_right), t1_right) = right;
+        pair[0] = left.i * t0_left + left.r * t1_left;
+        pair[1] = right.i * t1_right - right.r * t0_right;
     }
 }
 
@@ -1085,3 +1079,7 @@ mod mdct_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "mdct_post_rotation_tests.rs"]
+mod contiguous_post_rotation_tests;
